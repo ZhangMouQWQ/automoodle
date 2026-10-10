@@ -4,8 +4,8 @@
 // @version      4.3.7
 // @description  修复云端同步冲突解决机制（time-based）、cleanAnswer全角分隔符、subCount存储错误、单选题字母答案兼容
 // @author       You
-// @updateURL    https://raw.githubusercontent.com/ZhangMouQWQ/automoodle/main/Moodle%20%E9%A2%98%E5%BA%93%E5%8A%A9%E6%89%8B%20-%20%E4%BA%91%E7%AB%AF%E7%89%88-4.3.5.user.js
-// @downloadURL  https://raw.githubusercontent.com/ZhangMouQWQ/automoodle/main/Moodle%20%E9%A2%98%E5%BA%93%E5%8A%A9%E6%89%8B%20-%20%E4%BA%91%E7%AB%AF%E7%89%88-4.3.5.user.js
+// @updateURL    https://raw.githubusercontent.com/ZhangMouQWQ/automoodle/refs/heads/main/Moodle.js
+// @downloadURL  https://raw.githubusercontent.com/ZhangMouQWQ/automoodle/refs/heads/main/Moodle.js
 // @match        https://moodle.syxy.ouchn.cn/*
 // @match        https://*.ouchn.cn/*
 // @match        https://*.moodle.*/*
