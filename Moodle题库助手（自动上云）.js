@@ -51,7 +51,11 @@
                     }
                     resolve(result);
                 },
-                onerror() { reject(new Error('云端网络请求失败')); },
+                onerror(details) {
+                    console.error('[Cloud] GM_xmlhttpRequest failed:', details);
+                    const reason = details?.error || details?.statusText || details?.responseText;
+                    reject(new Error(reason ? `云端网络请求失败: ${reason}` : '云端网络请求失败；请查看控制台错误详情'));
+                },
                 ontimeout() { reject(new Error('云端请求超时')); },
             });
         });
