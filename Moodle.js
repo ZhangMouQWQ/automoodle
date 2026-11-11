@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Moodle 题库助手 - 云端版
 // @namespace    http://tampermonkey.net/
-// @version      4.3.7
-// @description  修复云端同步冲突解决机制（time-based）、cleanAnswer全角分隔符、subCount存储错误、单选题字母答案兼容
+// @version      4.5.0
+// @description  qid 唯一键防重复、整门课程一键抓取（自动遍历所有 quiz 的 review 页）、引号脏数据清洗、限流退避
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/ZhangMouQWQ/automoodle/refs/heads/main/Moodle.js
 // @downloadURL  https://raw.githubusercontent.com/ZhangMouQWQ/automoodle/refs/heads/main/Moodle.js
@@ -13,7 +13,7 @@
 // @grant        GM_getValue
 // @grant        GM_setClipboard
 // @grant        GM_xmlhttpRequest
-// @connect      tiku.homo.cc.cd
+// @connect      tiku.gzt.us.ci
 // @run-at       document-end
 // ==/UserScript==
 
@@ -23,7 +23,7 @@
     /* ==================== 云端配置（必填） ==================== */
     const CLOUD_CONFIG = {
         enabled: true,
-        endpoint: 'https://tiku.homo.cc.cd',
+        endpoint: 'https://tiku.gzt.us.ci',
         token: 'admin',
         autoSync: true,
         autoDownload: true,
@@ -71,6 +71,25 @@
         debug: true
     };
 
+    /* ==================== 当前测验上下文 ==================== */
+    // attempt = 一次作答记录ID（每次重考都会变），cmid = 活动ID（固定），
+    // 二者都不能当题目身份，只能用于限定/加权；题目身份用 qid。
+    const QuizContext = {
+        attempt: null,
+        cmid: null,
+        refresh() {
+            const p = new URLSearchParams(location.search);
+            this.attempt = p.get('attempt') || null;
+            if (/\/mod\/quiz\//.test(location.pathname)) {
+                this.cmid = p.get('cmid') || p.get('id') || null;
+            } else {
+                this.cmid = p.get('cmid') || null;
+            }
+            return this;
+        }
+    };
+    QuizContext.refresh();
+
     /* ==================== 全局状态锁 ==================== */
     let isCapturing = false;
     let isSyncing = false;
@@ -101,6 +120,7 @@
                         updated++;
                     }
                 }
+                bank.migrateKeys();
                 bank.save();
 
                 const result = await cloudRequest('POST', bank.data);
@@ -135,6 +155,7 @@
                         updated++;
                     }
                 }
+                bank.migrateKeys();
                 bank.save();
                 FloatWindow.updateStatus();
                 if (updated > 0) FloatWindow.showToast(`☁️ 下载完成：更新 ${updated} 题`, 'success');
@@ -169,15 +190,41 @@
             catch (e) { return {}; }
         }
         save() { GM_setValue(this.storageKey, JSON.stringify(this.data)); }
-        normalize(text, type) {
-            let r = TextCleaner.unifyQuotes(text)
+        normalizeFull(text) {
+            return TextCleaner.unifyQuotes(text)
                 .replace(/^\d+[\.\、]\s*/, '')
                 .replace(/\s+/g, '')
                 .replace(/[，。？！.,?!;；]/g, '')
                 .toLowerCase()
                 .trim();
+        }
+        normalize(text, type) {
+            const r = this.normalizeFull(text);
             if (type === 'multianswer') return r.substring(0, 300);
             return r.substring(0, 60);
+        }
+        // qid 是 Moodle 题库中该题的稳定ID，重考/换课程/换 attempt 都不变，
+        // 用它做键才能彻底避免"题干前60字相同"造成的误命中。
+        keyFor(title, type, qid) {
+            return qid ? 'q_' + qid : this.normalize(title, type);
+        }
+        hash(s) {
+            let h1 = 0x811c9dc5, h2 = 0x01000193;
+            for (let i = 0; i < s.length; i++) {
+                const c = s.charCodeAt(i);
+                h1 = Math.imul(h1 ^ c, 16777619) >>> 0;
+                h2 = (h2 + c * (i + 1)) >>> 0;
+            }
+            return h1.toString(36) + h2.toString(36);
+        }
+        rememberCmid(record, cmid) {
+            if (!record || !cmid) return;
+            cmid = String(cmid);
+            if (!Array.isArray(record.cmids)) record.cmids = [];
+            if (record.cmids.includes(cmid)) return;
+            record.cmids.unshift(cmid);
+            record.cmids = record.cmids.slice(0, 10);
+            this.save();
         }
         similarity(s1, s2, type) {
             s1 = this.normalize(s1, type); s2 = this.normalize(s2, type);
@@ -191,11 +238,48 @@
             return same / longer.length;
         }
 
-        add(title, options, answers, type, subCount) {
-            const key = this.normalize(title, type);
-            const existing = this.data[key];
+        // 旧数据是按「题干截断键」存的，这里用完整题干精确认领，
+        // 只有完整题干一致才认为同题，避免碰撞键误伤。
+        findLegacyByFullTitle(title, type) {
+            const full = this.normalizeFull(title);
+            for (const k in this.data) {
+                const rec = this.data[k];
+                if (!rec || !rec.title || rec.qid) continue;
+                if (this.normalizeFull(rec.title) === full) {
+                    return { key: k, record: rec };
+                }
+            }
+            return null;
+        }
+
+        add(title, options, answers, type, subCount, qid, cmid) {
+            let key = this.keyFor(title, type, qid);
             const cleanAnswers = answers.map(a => a.trim());
             const cleanOptions = options.map(o => o.trim());
+
+            // 没有 qid 时，若题干键已被另一道「前60字相同但完整题干不同」的题占用，
+            // 就退化用完整题干的哈希当键，保证两题各自独立而不是互相覆盖。
+            if (!qid && this.data[key]) {
+                const occupant = this.data[key];
+                if (this.normalizeFull(occupant.title) !== this.normalizeFull(title)) {
+                    key = 'f_' + this.hash(this.normalizeFull(title));
+                }
+            }
+
+            let existing = this.data[key];
+
+            if (!existing) {
+                const legacy = this.findLegacyByFullTitle(title, type);
+                if (legacy) {
+                    existing = legacy.record;
+                    if (qid) {
+                        // 认领成功：迁移到 qid 键，彻底脱离碰撞风险
+                        this.data[key] = existing;
+                        delete this.data[legacy.key];
+                        existing.qid = existing.qid || String(qid);
+                    }
+                }
+            }
 
             if (existing) {
                 let changed;
@@ -218,6 +302,12 @@
                     existing.options = cleanOptions;
                     existing.time = Date.now();
                     existing.count++;
+                    existing.qid = existing.qid || (qid ? String(qid) : undefined);
+                    // 新抓到的答案更完整时，清掉不完整标记
+                    if (type === 'multianswer') {
+                        existing.incomplete = (subCount > 0 && cleanAnswers.some(a => !a)) ? true : undefined;
+                    }
+                    this.rememberCmid(existing, cmid);
                     this.save();
                     this.log('🔄 答案更新', `"${title.substring(0,30)}..."`, '旧:', oldAnswersDisplay.join('、'), '→ 新:', newAnswersDisplay.join('、'));
                     FloatWindow.updateStatus();
@@ -225,6 +315,8 @@
                 } else {
                     existing.count++;
                     existing.time = Date.now();
+                    existing.qid = existing.qid || (qid ? String(qid) : undefined);
+                    this.rememberCmid(existing, cmid);
                     this.save();
                     this.log('✅ 录入(重复)', `"${title.substring(0,30)}..."`, '→', cleanAnswers.join('、'));
                     FloatWindow.updateStatus();
@@ -239,7 +331,10 @@
                 time: Date.now(),
                 count: 1,
                 type: type || 'unknown',
-                subCount: type === 'multianswer' ? (subCount || answers.length) : 0
+                subCount: type === 'multianswer' ? (subCount || answers.length) : 0,
+                qid: qid ? String(qid) : undefined,
+                cmids: cmid ? [String(cmid)] : [],
+                incomplete: type === 'multianswer' && subCount > 0 && answers.some(a => !a) ? true : undefined
             };
             this.save();
             this.log('✅ 新录入', `"${title.substring(0,30)}..."`, '→', cleanAnswers.join('、'));
@@ -247,11 +342,25 @@
             return { action: 'new' };
         }
 
-        find(title, type, subCount) {
+        find(title, type, subCount, qid) {
+            // 1) qid 命中：唯一且绝对可靠
+            if (qid) {
+                const byQid = this.data['q_' + qid];
+                if (byQid) return byQid;
+            }
+
+            // 2) 题干键精确命中：必须完整题干一致，否则视为碰撞，拒绝返回
             const key = this.normalize(title, type);
+            const fkey = 'f_' + this.hash(this.normalizeFull(title));
+            if (this.data[fkey] && this.normalizeFull(this.data[fkey].title) === this.normalizeFull(title)) {
+                return this.data[fkey];
+            }
             if (this.data[key]) {
                 const record = this.data[key];
-                if (type === 'multianswer' && subCount && record.subCount && record.subCount !== subCount) {
+                const sameFullTitle = this.normalizeFull(record.title) === this.normalizeFull(title);
+                if (!sameFullTitle) {
+                    this.log('⚠️ 题干键碰撞已拒绝', `"${title.substring(0,30)}..."`);
+                } else if (type === 'multianswer' && subCount && record.subCount && record.subCount !== subCount) {
                     this.log('⚠️ 精确匹配但子问题数量不符');
                 } else {
                     return record;
@@ -260,6 +369,7 @@
 
             const threshold = type === 'multianswer' ? CONFIG.multianswerMatchThreshold : CONFIG.matchThreshold;
             let bestMatch = null, bestSim = 0;
+            const exactTies = new Set();
 
             for (const k in this.data) {
                 const record = this.data[k];
@@ -268,11 +378,20 @@
                     if (subCount && record.subCount && record.subCount !== subCount) continue;
                 }
                 if (type === 'ddmatch' && record.type !== 'ddmatch') continue;
+                // 已知两侧 qid 却不同 → 不是同一题，禁止模糊匹配误伤
+                if (qid && record.qid && String(record.qid) !== String(qid)) continue;
                 const sim = this.similarity(record.title, title, type);
+                if (sim >= 0.999) exactTies.add(k);
                 if (sim >= threshold && sim > bestSim) {
                     bestSim = sim;
                     bestMatch = record;
                 }
+            }
+
+            // 题干完全相同但存在多道不同的题（各自不同 qid）→ 无法判定，宁可不答
+            if (!qid && exactTies.size > 1) {
+                this.log('⚠️ 存在多道题干相同的题，已跳过以避免错答', `"${title.substring(0,30)}..."`);
+                return null;
             }
 
             if (bestMatch) {
@@ -299,9 +418,11 @@
                 this.data = imported;
                 count = Object.keys(imported).length;
             } else {
-                for (const key in imported) {
-                    const newRecord = imported[key];
+                for (const rawKey in imported) {
+                    const newRecord = imported[rawKey];
                     if (!newRecord || !newRecord.title) continue;
+                    // 有 qid 的记录一律落到 q_<qid>，避免与旧题干键并存成两份
+                    const key = newRecord.qid ? 'q_' + newRecord.qid : rawKey;
                     const existing = this.data[key];
                     if (!existing) {
                         this.data[key] = newRecord;
@@ -325,6 +446,43 @@
             const all = this.getAll();
             return { total: all.length, repeated: all.filter(q => q.count > 1).length };
         }
+        // 把带 qid 的记录统一迁到 q_<qid> 键；无 qid 的记录保持题干键不变。
+        // 旧版本存的是截断题干键，与 qid 键并存会导致同题两份，这里合并去重。
+        migrateKeys() {
+            let moved = 0, merged = 0;
+            for (const k of Object.keys(this.data)) {
+                const rec = this.data[k];
+                if (!rec || !rec.qid) continue;
+                const target = 'q_' + rec.qid;
+                if (k === target) continue;
+                this.data[target] = rec;
+                delete this.data[k];
+                moved++;
+            }
+            for (const k of Object.keys(this.data)) {
+                const rec = this.data[k];
+                if (!rec || rec.qid || !rec.title) continue;
+                const twin = Object.keys(this.data).find(t =>
+                    t !== k && this.data[t] && this.data[t].qid &&
+                    this.normalizeFull(this.data[t].title) === this.normalizeFull(rec.title));
+                if (twin) {
+                    const a = this.data[twin], b = rec;
+                    const keep = (b.time || 0) > (a.time || 0) ? b : a;
+                    this.data[twin] = Object.assign({}, a, b, keep, {
+                        qid: a.qid,
+                        cmids: a.cmids || b.cmids,
+                        count: (a.count || 1) + (b.count || 1)
+                    });
+                    delete this.data[k];
+                    merged++;
+                }
+            }
+            if (moved || merged) {
+                this.save();
+                this.log('🧩 键迁移完成', '迁移', moved, '合并', merged);
+            }
+            return { moved, merged };
+        }
         log(...args) { if (CONFIG.debug) console.log('[Moodle题库]', ...args); }
     }
 
@@ -338,13 +496,45 @@
                 .replace(/[\u201C\u201D]/g, '"')
                 .replace(/[\u2013\u2014]/g, '-');
         },
+        // Moodle 的题干/选项里偶尔会多出一个不成对的引号（如 ..."物理交互""），
+        // 只剥掉多余的那个，成对的引号必须保留，否则会把 "两个一百年" 的右引号吃掉。
+        balanceQuotes(text) {
+            let s = String(text || '').trim();
+            const count = (str, ch) => (str.split(ch).length - 1);
+            for (let i = 0; i < 6; i++) {
+                let changed = false;
+                // 双引号：剥掉多余的不成对尾部引号
+                if (s.endsWith('""')) { s = s.slice(0, -1); changed = true; }
+                if (count(s, '"') % 2 === 1 && s.endsWith('"')) { s = s.slice(0, -1); changed = true; }
+                // 单引号只在「整段被它包裹」时才算引号；
+                // I'm / it's / don't 里的 ' 是英文缩写，不能剥。
+                if (s.length > 2 && s.startsWith("'") && s.endsWith("'") && count(s, "'") === 2) {
+                    s = s.slice(1, -1); changed = true;
+                }
+                s = s.trim();
+                if (!changed) break;
+            }
+            return s;
+        },
         cleanAnswer(text) {
-            return this.unifyQuotes(text)
-                .replace(/^([a-dA-D])[.．、)）\\]］]\\s*/i, '')
-                .replace(/^[""''""''『「«‹]+/, '')
+            // 注意：unifyQuotes 已把全角引号统一成半角 " 和 '，
+            // 因此这里必须用半角引号，否则剥离不到、答案会残留 ""
+            let s = this.unifyQuotes(text)
+                .replace(/^[a-dA-D][.．、)）\]］]\s*/i, '')
                 .replace(/^[：:]\s*/, '')
-                .replace(/[""''""''』」»›。！？.!?]+$/, '')
                 .trim();
+
+            // 1) 整体被引号包裹（如 "正确答案"）→ 成对剥掉
+            for (let i = 0; i < 3; i++) {
+                const m = /^(["'『「«‹])([\s\S]*)(["'』」»›])$/.exec(s);
+                if (!m) break;
+                s = m[2].trim();
+            }
+            // 2) 剥掉多余的、不成对的尾部引号
+            s = this.balanceQuotes(s);
+            // 3) 句末标点
+            s = s.replace(/[。！？!?]+$/, '').replace(/\.$/, '').trim();
+            return s;
         },
         extractAnswerPart(text) {
             return this.unifyQuotes(text)
@@ -421,6 +611,21 @@
             return el.querySelectorAll('.subquestion').length;
         },
 
+        // Moodle 在每题里埋了 questionflagpostdata，值形如
+        //   qaid=45861630&qubaid=2804425&qid=283959&slot=2&checksum=...
+        // qid 是题库中该题的稳定 ID（重考/换 attempt/换课程都不变），
+        // 作为唯一键可以彻底避免题干重复/截断造成的误命中。
+        getQid(el) {
+            const flag = el.querySelector('.questionflagpostdata');
+            if (flag && flag.value) {
+                const m = /(?:^|[?&])qid=(\d+)/.exec(flag.value);
+                if (m) return m[1];
+            }
+            // 注意：.que 的 id 形如 question-{qubaid}-{slot}，那是作答实例ID而非 qid，
+            // 因此不能用它兜底，否则每次重考都会生成新键。宁可回退到题干键。
+            return null;
+        },
+
         getOptions(el) {
             const classes = el.className || '';
             if (classes.includes('multianswer')) {
@@ -471,8 +676,8 @@
                 text = text.trim();
                 const cleanText = text.replace(/^([a-dA-D])[.\．、)\）\]\］]\s*/i, '').trim();
                 return {
-                    text: TextCleaner.unifyQuotes(cleanText),
-                    fullText: TextCleaner.unifyQuotes(text),
+                    text: TextCleaner.balanceQuotes(TextCleaner.unifyQuotes(cleanText)),
+                    fullText: TextCleaner.balanceQuotes(TextCleaner.unifyQuotes(text)),
                     element: item,
                     input: input,
                     index: idx
@@ -723,6 +928,7 @@
                     const qno = qEl.querySelector('.qno')?.textContent?.trim() || (idx + 1);
                     const qType = Parser.getQuestionType(qEl);
                     const subCount = Parser.getSubCount(qEl);
+                    const qid = Parser.getQid(qEl);
 
                     if (!title) { skipped.push({ no: qno, reason: '无标题' }); return; }
 
@@ -742,7 +948,7 @@
 
                     bank.log(`📥 第${qno}题抓取结果:`, '类型:', qType, '答案:', answers, '选项:', options.map(o => o.text));
 
-                    const result = bank.add(title, options.map(o => o.text), answers, qType, subCount);
+                    const result = bank.add(title, options.map(o => o.text), answers, qType, subCount, qid, QuizContext.cmid);
                     if (result.action === 'new') newCount++;
                     else if (result.action === 'duplicate') dupCount++;
                     else if (result.action === 'updated') updateCount++;
@@ -788,11 +994,19 @@
                 if (!title) return;
                 const qType = Parser.getQuestionType(qEl);
                 const subCount = Parser.getSubCount(qEl);
+                const qid = Parser.getQid(qEl);
 
-                const record = bank.find(title, qType, subCount);
+                const record = bank.find(title, qType, subCount, qid);
                 if (!record) {
                     missed++;
                     bank.log('❌ 未命中', `"${title.substring(0,40)}..."`, `类型:${qType} 子问题:${subCount}`);
+                    return;
+                }
+
+                // 标记为 incomplete 的完形填空有没抓到的空位，作答反而会错，直接跳过
+                if (record.incomplete && qType === 'multianswer') {
+                    missed++;
+                    bank.log('⏭️ 跳过不完整的完形填空', `"${title.substring(0,40)}..."`);
                     return;
                 }
 
@@ -921,6 +1135,150 @@
         }
     };
 
+    /* ==================== 整门课程题库抓取 ==================== */
+    // 题库不在独立文件里，题目来自课程的每个 quiz 活动；
+    // 只要有过作答记录，review.php 就会连正确答案一起渲染，可逐题抽取。
+    const Harvester = {
+        running: false,
+        sleep(ms) { return new Promise(r => setTimeout(r, ms)); },
+
+        // Moodle 会限流，连续请求会返回 418，需要退避重试
+        async fetchDoc(url, retries = 6) {
+            for (let i = 1; i <= retries; i++) {
+                let res;
+                try {
+                    res = await fetch(url, { credentials: 'include' });
+                } catch (e) {
+                    // ERR_EMPTY_RESPONSE / 网络抖动 也会出现，同样需要退避
+                    bank.log(`⏳ ${url} 网络异常，第 ${i} 次重试：${e.message}`);
+                    await this.sleep(5000 * i);
+                    continue;
+                }
+                if (res.ok) return new DOMParser().parseFromString(await res.text(), 'text/html');
+                if (res.status === 404 || res.status === 403) return null;
+                bank.log(`⏳ ${url} 返回 ${res.status}，第 ${i} 次重试`);
+                await this.sleep(5000 * i);
+            }
+            return null;
+        },
+
+        getCourseId() {
+            const m = /(?:^|\s)course-(\d+)(?:\s|$)/.exec(document.body.className || '');
+            if (m) return m[1];
+            const p = new URLSearchParams(location.search);
+            if (/\/course\//.test(location.pathname)) return p.get('id');
+            return null;
+        },
+
+        parseQuiz(doc) {
+            const rows = [];
+            doc.querySelectorAll(CONFIG.questionContainer).forEach(qEl => {
+                // 说明类条目（一、单项选择题 这种）没有题目和答案，跳过
+                if (/\bdescription\b/.test(qEl.className || '')) return;
+                const type = Parser.getQuestionType(qEl);
+                const title = Parser.getTitle(qEl);
+                if (!title) return;
+                const qid = Parser.getQid(qEl);
+                const options = Parser.getOptions(qEl);
+                const answers = Parser.detectAnswers(qEl, options);
+                if (!answers.length || answers.every(a => !a)) return;
+                const subCount = Parser.getSubCount(qEl);
+                rows.push({
+                    title,
+                    qid,
+                    type,
+                    subCount,
+                    options: options.map(o => o.text),
+                    answers,
+                    // 完形填空有空位没抓到，标记后答题端会跳过，避免填错
+                    incomplete: type === 'multianswer' && subCount > 0 && answers.some(a => !a)
+                });
+            });
+            return rows;
+        },
+
+        async harvest() {
+            if (this.running) { FloatWindow.showToast('⏳ 抓取进行中，请稍候', 'warning'); return; }
+            this.running = true;
+            const btn = document.getElementById('mfp-harvest');
+            const restore = () => {
+                this.running = false;
+                if (btn) { btn.disabled = false; btn.textContent = '📚 抓取整门课程'; }
+            };
+            if (btn) { btn.disabled = true; btn.textContent = '⏳ 抓取中...'; }
+
+            try {
+                const courseId = this.getCourseId();
+                if (!courseId) {
+                    FloatWindow.showToast('❌ 请在课程页面内使用', 'error');
+                    return restore();
+                }
+
+                const courseDoc = await this.fetchDoc(`/course/view.php?id=${courseId}`);
+                if (!courseDoc) { FloatWindow.showToast('❌ 无法读取课程页面', 'error'); return restore(); }
+
+                const cmids = [...new Set([...courseDoc.querySelectorAll('a[href*="/mod/quiz/view.php"]')]
+                    .map(a => (a.getAttribute('href').match(/[?&]id=(\d+)/) || [])[1])
+                    .filter(Boolean))];
+
+                if (!cmids.length) { FloatWindow.showToast('⚠️ 本课程没有测验活动', 'warning'); return restore(); }
+                bank.log('📚 发现测验:', cmids.join(', '));
+                FloatWindow.showToast(`📚 发现 ${cmids.length} 个测验，开始抓取`, 'info');
+
+                let newCount = 0, dupCount = 0, updateCount = 0, attempts = 0, failed = 0;
+
+                for (const cmid of cmids) {
+                    const viewDoc = await this.fetchDoc(`/mod/quiz/view.php?id=${cmid}`);
+                    if (!viewDoc) { failed++; continue; }
+
+                    const attemptIds = [...new Set([...viewDoc.querySelectorAll('a[href*="review.php?attempt="]')]
+                        .map(a => (a.getAttribute('href').match(/attempt=(\d+)/) || [])[1])
+                        .filter(Boolean))];
+
+                    if (!attemptIds.length) {
+                        bank.log(`⚠️ 测验 ${cmid} 无已完成作答，无法读取答案`);
+                        continue;
+                    }
+
+                    for (const attempt of attemptIds) {
+                        const doc = await this.fetchDoc(`/mod/quiz/review.php?attempt=${attempt}&cmid=${cmid}`);
+                        if (!doc) { failed++; continue; }
+                        attempts++;
+
+                        for (const row of this.parseQuiz(doc)) {
+                            const r = bank.add(row.title, row.options, row.answers, row.type, row.subCount, row.qid, cmid);
+                            if (r.action === 'new') newCount++;
+                            else if (r.action === 'duplicate') dupCount++;
+                            else if (r.action === 'updated') updateCount++;
+                        }
+                        FloatWindow.updateStatus();
+                        await this.sleep(3500);   // 控制请求频率，避免触发 418
+                    }
+                    await this.sleep(2000);
+                }
+
+                bank.migrateKeys();
+                const stats = bank.getStats();
+                let msg = `📚 新录入 ${newCount} 题`;
+                if (dupCount) msg += ` | 📌 重复 ${dupCount}`;
+                if (updateCount) msg += ` | 🔄 更新 ${updateCount}`;
+                msg += ` | 共 ${stats.total} 题`;
+                if (failed) msg += ` | ⚠️ 失败 ${failed}`;
+                FloatWindow.showToast(msg, newCount > 0 ? 'success' : 'info');
+                bank.log(`✅ 抓取完成：${cmids.length} 测验 / ${attempts} 次作答`);
+
+                if (CLOUD_CONFIG.enabled && CLOUD_CONFIG.autoSync) {
+                    setTimeout(() => CloudAPI.sync(), 500);
+                }
+            } catch (e) {
+                console.error('[Harvester]', e);
+                FloatWindow.showToast('❌ 抓取失败: ' + e.message, 'error');
+            } finally {
+                restore();
+            }
+        }
+    };
+
     /* ==================== 悬浮窗 UI ==================== */
     const FloatWindow = {
         container: null,
@@ -959,6 +1317,7 @@
                     </div>
                     <div style="display: flex; flex-direction: column; gap: 8px;">
                         <button id="mfp-capture" style="width: 100%; padding: 10px; border: none; border-radius: 10px; background: #3b82f6; color: white; font-size: 13px; font-weight: 500; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; box-shadow: 0 2px 8px rgba(59,130,246,0.3);">📥 抓取当前页答案</button>
+                        <button id="mfp-harvest" style="width: 100%; padding: 10px; border: none; border-radius: 10px; background: #0ea5e9; color: white; font-size: 13px; font-weight: 500; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; box-shadow: 0 2px 8px rgba(14,165,233,0.3);">📚 抓取整门课程</button>
                         <button id="mfp-answer" style="width: 100%; padding: 10px; border: none; border-radius: 10px; background: #10b981; color: white; font-size: 13px; font-weight: 500; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; box-shadow: 0 2px 8px rgba(16,185,129,0.3);">▶️ 执行自动答题</button>
                         <button id="mfp-cloud" style="width: 100%; padding: 10px; border: none; border-radius: 10px; background: #8b5cf6; color: white; font-size: 13px; font-weight: 500; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; box-shadow: 0 2px 8px rgba(139,92,246,0.3);">☁️ 同步云端题库</button>
                         <button id="mfp-manage" style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 10px; background: white; color: #475569; font-size: 13px; font-weight: 500; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px;">📋 打开题库管理</button>
@@ -978,6 +1337,7 @@
             div.querySelector('#mfp-min').onclick = () => this.toggleMinimize();
             div.querySelector('#mfp-close').onclick = () => this.hide();
             div.querySelector('#mfp-capture').onclick = () => Core.capture();
+            div.querySelector('#mfp-harvest').onclick = () => Harvester.harvest();
             div.querySelector('#mfp-answer').onclick = () => Core.answer();
             div.querySelector('#mfp-cloud').onclick = () => CloudAPI.sync();
             div.querySelector('#mfp-manage').onclick = () => Manager.show();
@@ -1162,7 +1522,7 @@
                                 `}
                                 <div style="display: flex; justify-content: space-between; align-items: center;">
                                     <span style="font-size: 12px; color: #10b981; font-weight: 600;">✓ ${q.answers.join('、')}</span>
-                                    <span style="font-size: 11px; color: #94a3b8;">命中 ${q.count} 次 · ${new Date(q.time).toLocaleDateString()}</span>
+                                    <span style="font-size: 11px; color: #94a3b8;">${q.qid ? 'qid:' + q.qid + ' · ' : ''}命中 ${q.count} 次 · ${new Date(q.time).toLocaleDateString()}</span>
                                 </div>
                             </div>
                         `).join('')}
@@ -1229,6 +1589,7 @@
         document.head.appendChild(style);
 
         FloatWindow.create();
+        bank.migrateKeys();
         FloatWindow.updateStatus();
 
         const questions = Parser.getQuestions();
@@ -1245,6 +1606,7 @@
         new MutationObserver(() => {
             if (location.href !== lastUrl) {
                 lastUrl = location.href;
+                QuizContext.refresh();
                 hadFeedbackOnLoad = false;
                 setTimeout(() => {
                     FloatWindow.updateStatus();

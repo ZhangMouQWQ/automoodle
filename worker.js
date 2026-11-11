@@ -1,4 +1,4 @@
-// Cloudflare Worker - Moodle 题库云端服务 v4.2
+// Cloudflare Worker - Moodle 题库云端服务 v4.3
 // 绑定 KV Namespace: BANK_KV
 
 const CORS_HEADERS = {
@@ -48,14 +48,17 @@ export default {
         for (const k in body) {
           const rec = body[k];
           if (!rec || !rec.title) continue;
-          const old = bank[k];
+          // 有 qid 的一律使用 q_<qid> 作为键，与旧题干键并存会造成同题两份
+          const key = rec.qid ? 'q_' + rec.qid : k;
+          if (key !== k) delete bank[k];
+          const old = bank[key];
           if (!old) {
-            bank[k] = rec;
+            bank[key] = rec;
           } else {
             if ((rec.time || 0) > (old.time || 0)) {
-              bank[k] = rec;
+              bank[key] = rec;
             } else if ((rec.time || 0) === (old.time || 0) && (rec.count || 0) > (old.count || 0)) {
-              bank[k] = rec;
+              bank[key] = rec;
             }
           }
         }
@@ -78,7 +81,21 @@ export default {
           delete bank[body.key];
         }
 
-        const key = normalizeKey(body.title, body.type);
+        // 保持 qid 键：由用户脚本写入的记录以 q_<qid> 为键，
+        // 编辑时必须沿用它，否则会退回题干键、重新引入碰撞风险。
+        let key;
+        if (body.key && String(body.key).startsWith('q_')) key = body.key;
+        else if (body.qid) key = 'q_' + body.qid;
+        else {
+          key = normalizeKey(body.title, body.type);
+          // 题干键已被「完整题干不同」的另一题占用时，改用完整题干哈希键
+          const occupant = bank[key];
+          if (occupant && normalizeFull(occupant.title) !== normalizeFull(body.title)) {
+            key = fullKey(body.title);
+          }
+        }
+        if (key !== body.key && bank[key]) key = fullKey(body.title);
+
         bank[key] = {
           title: body.title,
           options: body.options || [],
@@ -86,7 +103,10 @@ export default {
           time: Date.now(),
           count: body.count || 1,
           type: body.type || 'unknown',
-          subCount: body.subCount || 0
+          subCount: body.subCount || 0,
+          incomplete: body.incomplete || undefined,
+          qid: body.qid || (key.startsWith('q_') ? key.slice(2) : undefined),
+          cmids: body.cmids || []
         };
         await env.BANK_KV.put(userKey, JSON.stringify(bank));
         return resp({ success: true, key, count: Object.keys(bank).length });
@@ -122,6 +142,29 @@ function normalizeKey(text, type) {
     .trim();
   if (type === 'multianswer') return r.substring(0, 300);
   return r.substring(0, 60);
+}
+
+function normalizeFull(text) {
+  return text
+    .replace(/[\u2018\u2019\u201B\uFF07]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2013\u2014]/g, '-')
+    .replace(/^\d+[\.\、]\s*/, '')
+    .replace(/\s+/g, '')
+    .replace(/[，。？！.,?!;；]/g, '')
+    .toLowerCase()
+    .trim();
+}
+
+function fullKey(text) {
+  const s = normalizeFull(text);
+  let h1 = 0x811c9dc5, h2 = 0x01000193;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 16777619) >>> 0;
+    h2 = (h2 + c * (i + 1)) >>> 0;
+  }
+  return 'f_' + h1.toString(36) + h2.toString(36);
 }
 
 function adminPage(token) {
@@ -226,6 +269,11 @@ function adminPage(token) {
         <label>子问题数量（multianswer 填写）</label>
         <input type="number" id="editSubCount" value="0" min="0">
       </div>
+      <div class="form-group">
+        <label>Moodle 题目 ID（qid，可选）</label>
+        <input type="text" id="editQid" placeholder="如 283959">
+        <small>qid 是题目在 Moodle 题库中的唯一 ID，填入后该题以 qid 为键，题干重复也不会串题</small>
+      </div>
     </div>
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal()">取消</button>
@@ -266,7 +314,7 @@ function render() {
     const optionsHtml = (q.options || []).map(o => '<span class="tag tag-gray">' + escapeHtml(o) + '</span>').join('');
     html += '<div class="card">' +
       '<div class="card-title">' + (i+1) + '. ' + escapeHtml(q.title) + '</div>' +
-      '<div class="card-meta">类型: ' + (q.type||'unknown') + ' | 命中 ' + (q.count||0) + ' 次</div>' +
+      '<div class="card-meta">类型: ' + (q.type||'unknown') + (q.qid ? ' | qid: ' + escapeHtml(String(q.qid)) : '') + ' | 命中 ' + (q.count||0) + ' 次' + (q.incomplete ? ' | <span style="color:#f59e0b">⚠️ 答案不完整</span>' : '') + '</div>' +
       (optionsHtml && !isDDMatch ? '<div class="card-answers">' + optionsHtml + '</div>' : '') +
       '<div class="card-answers">' + answersHtml + '</div>' +
       '<div class="card-actions">' +
@@ -292,6 +340,7 @@ function openModal() {
   document.getElementById('editOptions').value = '';
   document.getElementById('editAnswers').value = '';
   document.getElementById('editSubCount').value = '0';
+  document.getElementById('editQid').value = '';
   document.getElementById('modalTitle').textContent = '新增题目';
   document.getElementById('modal').classList.add('active');
 }
@@ -310,6 +359,7 @@ function editItem(encodedKey) {
   document.getElementById('editOptions').value = (q.options || []).join(' / ');
   document.getElementById('editAnswers').value = (q.answers || []).join(' / ');
   document.getElementById('editSubCount').value = q.subCount || 0;
+  document.getElementById('editQid').value = q.qid || '';
   document.getElementById('modalTitle').textContent = '编辑题目';
   document.getElementById('modal').classList.add('active');
 }
@@ -321,8 +371,9 @@ async function saveItem() {
   const options = document.getElementById('editOptions').value.split('/').map(s => s.trim()).filter(Boolean);
   const answers = document.getElementById('editAnswers').value.split('/').map(s => s.trim()).filter(Boolean);
   const subCount = parseInt(document.getElementById('editSubCount').value) || 0;
+  const qid = document.getElementById('editQid').value.trim();
   if (!title || answers.length === 0) { alert('请填写题干和答案'); return; }
-  const body = { key, title, options, answers, type, subCount, count: 1, time: Date.now() };
+  const body = { key, title, options, answers, type, subCount, qid: qid || undefined, count: 1, time: Date.now() };
   const res = await fetch(API + '/item?token=' + TOKEN, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
