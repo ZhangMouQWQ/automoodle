@@ -268,16 +268,28 @@
 
             let existing = this.data[key];
 
-            if (!existing) {
+            // 页面有 qid 时，除了当前键，还要认领「同题但没 qid」的旧记录：
+            // 云端已有 q_<qid> 而本地残留旧题干键时，不认领就会留下两份。
+            if (qid) {
                 const legacy = this.findLegacyByFullTitle(title, type);
-                if (legacy) {
-                    existing = legacy.record;
-                    if (qid) {
-                        // 认领成功：迁移到 qid 键，彻底脱离碰撞风险
+                if (legacy && legacy.key !== key) {
+                    if (!existing) {
+                        existing = legacy.record;
                         this.data[key] = existing;
-                        delete this.data[legacy.key];
-                        existing.qid = existing.qid || String(qid);
+                        existing.qid = String(qid);
+                    } else {
+                        // 两份都要合并成一个：count 相加，取更新的答案
+                        const keep = (legacy.record.time || 0) > (existing.time || 0) ? legacy.record : existing;
+                        existing.answers = keep.answers;
+                        existing.options = keep.options;
+                        existing.count = (existing.count || 1) + (legacy.record.count || 1);
+                        existing.time = Math.max(existing.time || 0, legacy.record.time || 0);
+                        existing.qid = String(qid);
+                        const cmids = new Set([...(existing.cmids || []), ...(legacy.record.cmids || [])]);
+                        if (cmids.size) existing.cmids = [...cmids];
                     }
+                    delete this.data[legacy.key];
+                    this.log('🔗 认领旧记录到 qid 键', legacy.key.substring(0, 20) + '...', '→', key);
                 }
             }
 
