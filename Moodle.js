@@ -1325,7 +1325,7 @@
                 <div id="mfp-body" style="padding: 16px;">
                     <div id="mfp-status" style="background: #f1f5f9; border-radius: 10px; padding: 10px 12px; margin-bottom: 14px; font-size: 12px; color: #475569; display: flex; justify-content: space-between; align-items: center;">
                         <span>📚 题库: <strong id="mfp-count" style="color: #3b82f6;">${stats.total}</strong> 题</span>
-                        <span style="font-size: 11px; color: #94a3b8;">🔄 ${stats.repeated}</span>
+                        <span style="font-size: 11px; color: #94a3b8;">☁️ 云端</span>
                     </div>
                     <div style="display: flex; flex-direction: column; gap: 8px;">
                         <button id="mfp-capture" style="width: 100%; padding: 10px; border: none; border-radius: 10px; background: #3b82f6; color: white; font-size: 13px; font-weight: 500; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; box-shadow: 0 2px 8px rgba(59,130,246,0.3);">📥 抓取当前页答案</button>
@@ -1498,7 +1498,7 @@
                     <div style="padding: 20px 24px; border-bottom: 1px solid #e2e8f0; background: #f8fafc; display: flex; justify-content: space-between; align-items: center;">
                         <div>
                             <h3 style="margin: 0; font-size: 18px; color: #0f172a;">📋 题库管理</h3>
-                            <p style="margin: 4px 0 0; font-size: 12px; color: #64748b;">共 ${stats.total} 题 · 重复 ${stats.repeated} 题</p>
+                            <p style="margin: 4px 0 0; font-size: 12px; color: #64748b;">共 ${stats.total} 题</p>
                         </div>
                         <button id="mm-close" style="background: #f1f5f9; border: none; width: 32px; height: 32px; border-radius: 8px; cursor: pointer; color: #64748b; font-size: 16px;">✕</button>
                     </div>
@@ -1534,7 +1534,7 @@
                                 `}
                                 <div style="display: flex; justify-content: space-between; align-items: center;">
                                     <span style="font-size: 12px; color: #10b981; font-weight: 600;">✓ ${q.answers.join('、')}</span>
-                                    <span style="font-size: 11px; color: #94a3b8;">${q.qid ? 'qid:' + q.qid + ' · ' : ''}命中 ${q.count} 次 · ${new Date(q.time).toLocaleDateString()}</span>
+                                    <span style="font-size: 11px; color: #94a3b8;">${q.qid ? 'qid:' + q.qid + ' · ' : ''}${new Date(q.time).toLocaleDateString()}</span>
                                 </div>
                             </div>
                         `).join('')}

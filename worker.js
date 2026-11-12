@@ -314,7 +314,7 @@ function render() {
     const optionsHtml = (q.options || []).map(o => '<span class="tag tag-gray">' + escapeHtml(o) + '</span>').join('');
     html += '<div class="card">' +
       '<div class="card-title">' + (i+1) + '. ' + escapeHtml(q.title) + '</div>' +
-      '<div class="card-meta">类型: ' + (q.type||'unknown') + (q.qid ? ' | qid: ' + escapeHtml(String(q.qid)) : '') + ' | 命中 ' + (q.count||0) + ' 次' + (q.incomplete ? ' | <span style="color:#f59e0b">⚠️ 答案不完整</span>' : '') + '</div>' +
+      '<div class="card-meta">类型: ' + (q.type||'unknown') + (q.qid ? ' | qid: ' + escapeHtml(String(q.qid)) : '') + (q.incomplete ? ' | <span style="color:#f59e0b">⚠️ 答案不完整</span>' : '') + '</div>' +
       (optionsHtml && !isDDMatch ? '<div class="card-answers">' + optionsHtml + '</div>' : '') +
       '<div class="card-answers">' + answersHtml + '</div>' +
       '<div class="card-actions">' +
