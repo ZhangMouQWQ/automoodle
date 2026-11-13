@@ -1315,7 +1315,7 @@
             div.innerHTML = `
                 <div id="mfp-header" style="padding: 14px 16px; background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); color: white; cursor: move; display: flex; justify-content: space-between; align-items: center; border-radius: 15px 15px 0 0;">
                     <div style="display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 14px;">
-                        <span style="font-size: 16px;">🧠</span><span>Moodle 题库助手</span>
+                        <span style="font-size: 16px;">🧠</span><span>题库助手</span>
                     </div>
                     <div style="display: flex; gap: 6px;">
                         <button id="mfp-min" style="background: rgba(255,255,255,0.2); border: none; color: white; width: 24px; height: 24px; border-radius: 6px; cursor: pointer; font-size: 12px; display: flex; align-items: center; justify-content: center;">─</button>
