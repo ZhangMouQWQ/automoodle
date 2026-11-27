@@ -536,16 +536,15 @@
                 .replace(/^[：:]\s*/, '')
                 .trim();
 
-            // 1) 整体被引号包裹（如 "正确答案"）→ 成对剥掉
+            // 引号可能包在句末标点内（如 "错"。），交替清理直到得到可匹配的选项文本
             for (let i = 0; i < 3; i++) {
                 const m = /^(["'『「«‹])([\s\S]*)(["'』」»›])$/.exec(s);
-                if (!m) break;
-                s = m[2].trim();
+                if (m) s = m[2].trim();
+                s = this.balanceQuotes(s)
+                    .replace(/[。！？!?]+$/, '')
+                    .replace(/\.$/, '')
+                    .trim();
             }
-            // 2) 剥掉多余的、不成对的尾部引号
-            s = this.balanceQuotes(s);
-            // 3) 句末标点
-            s = s.replace(/[。！？!?]+$/, '').replace(/\.$/, '').trim();
             return s;
         },
         extractAnswerPart(text) {
